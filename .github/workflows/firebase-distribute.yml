@@ -1,0 +1,98 @@
+name: Distribute Android to Firebase App Distribution
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+
+jobs:
+  distribute-android:
+    name: Build & distribute Android
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: 17
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Prebuild Android (eject)
+        run: npx expo prebuild --platform android --non-interactive
+
+      - name: Configure signing
+        env:
+          ANDROID_KEYSTORE: ${{ secrets.ANDROID_KEYSTORE }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          # Decode keystore from base64 secret
+          echo "$ANDROID_KEYSTORE" | base64 -d > android/app/release-keystore.jks
+
+          # Inject signing config into android/app/build.gradle
+          node -e "
+            const fs = require('fs');
+            let g = fs.readFileSync('android/app/build.gradle', 'utf8');
+
+            // Add signingConfigs inside android { } if not present
+            const androidIdx = g.indexOf('android {');
+            if (androidIdx !== -1 && !g.includes('signingConfigs')) {
+              const insertPos = androidIdx + 'android {'.length;
+              const block = \`
+    signingConfigs {
+        release {
+            storeFile file(\"release-keystore.jks\")
+            storePassword System.env.ANDROID_KEYSTORE_PASSWORD
+            keyAlias System.env.ANDROID_KEY_ALIAS
+            keyPassword System.env.ANDROID_KEY_PASSWORD
+        }
+    }
+  \`;
+              g = g.slice(0, insertPos) + block + g.slice(insertPos);
+            }
+
+            // Apply signingConfig to release buildType if not present
+            if (!g.includes('signingConfig signingConfigs.release')) {
+              g = g.replace(
+                /release\s*\{([^}]*)\}/,
+                'release {\n            signingConfig signingConfigs.release\n            $1\n        }'
+              );
+            }
+
+            fs.writeFileSync('android/app/build.gradle', g);
+            console.log('build.gradle patched');
+          "
+
+      - name: Build Release AAB
+        working-directory: android
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: ./gradlew assembleRelease
+
+      - name: Distribute to Firebase App Distribution
+        env:
+          FIREBASE_TOKEN: ${{ secrets.FIREBASE_TOKEN }}
+        run: |
+          firebase appdistribution:distribute android/app/build/outputs/bundle/release/app-release.aab \
+            --app ${{ secrets.FIREBASE_APP_ID_ANDROID }} \
+            --groups testers \
+            --release-notes "$(git log -1 --pretty=%B)"
