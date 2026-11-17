@@ -33,6 +33,7 @@
     "@types/react": "^19",
     "@types/react-native": "*",
     "babel-preset-expo": "^58.0.26",
+    "eas-cli": "^27.10.0",
     "typescript": "^5.7.0"
   }
 }
