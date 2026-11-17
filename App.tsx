@@ -2,11 +2,28 @@ import { NavigationContainer } from '@react-navigation/native'
 import { createStackNavigator } from '@react-navigation/stack'
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs'
 import React from 'react'
+import { Provider } from 'react-redux'
 import {
   View, Text, StatusBar, StyleSheet, FlatList, TouchableOpacity, ActivityIndicator, TextInput, Linking,
 } from 'react-native'
+import { store } from './src/store'
+import {
+  useGetLinksQuery,
+  useGetInstitutionsQuery,
+  useCreateRequisitionMutation,
+  useGetAccountBalancesQuery,
+  useGetAccountTransactionsQuery,
+} from './src/services/gocardlessApi'
 import fmtAmount from './src/lib/format'
-import type { Link, Tx, Balance } from './src/types'
+import type { Institution } from './src/types'
+
+function apiErrorMessage(e: unknown): string {
+  if (e instanceof Error) return e.message
+  if (e && typeof e === 'object' && 'status' in e) {
+    return String((e as { data?: unknown }).data || '')
+  }
+  return String(e)
+}
 
 const Stack = createStackNavigator()
 const Tab = createBottomTabNavigator()
@@ -36,88 +53,74 @@ function Pill({ status }: { status?: string }) {
   return <Text style={[styles.pill, { color, borderColor: border }]}>{labelFor(s) || status || '?'}</Text>
 }
 
+// Componente invisibile che raccoglie il saldo di un singolo account via RTK Query
+function SilentAccountBalance({ accountId, onChange }: { accountId: string; onChange: (b: { amount?: string; currency?: string } | null) => void }) {
+  const { data } = useGetAccountBalancesQuery(accountId)
+  React.useEffect(() => {
+    if (!data) return
+    const list = data.balances || []
+    const picked = list.find((x) => x.balanceType === 'interimBooked') || list[0]
+    onChange(picked?.balanceAmount ? { amount: picked.balanceAmount.amount, currency: picked.balanceAmount.currency } : null)
+  }, [data, accountId, onChange])
+  return null
+}
+
+function AccountBalanceCollector({ accountIds, onChange }: { accountIds: string[]; reloadKey: number; onChange: (balances: Record<string, { amount?: string; currency?: string } | null>) => void }) {
+  const [balances, setBalances] = React.useState<Record<string, { amount?: string; currency?: string } | null>>({})
+  React.useEffect(() => {
+    onChange(balances)
+  }, [balances, onChange])
+  return (
+    <>
+      {accountIds.map((id) => (
+        <SilentAccountBalance
+          key={id}
+          accountId={id}
+          onChange={(b) => setBalances((prev) => ({ ...prev, [id]: b }))}
+        />
+      ))}
+    </>
+  )
+}
+
 function HomeScreen() {
-  const [links, setLinks] = React.useState<Link[]>([])
+  const { data: links, isLoading: linksLoading, error: linksError, refetch: refetchLinks } = useGetLinksQuery()
   const [selectedAccount, setSelectedAccount] = React.useState<string | null>(null)
-  const [balances, setBalances] = React.useState<{ balances?: Balance[] } | null>(null)
-  const [txs, setTxs] = React.useState<{ transactions?: { booked?: Tx[]; pending?: Tx[] } } | null>(null)
-  const [accountBalances, setAccountBalances] = React.useState<Record<string, { amount?: string; currency?: string } | null>>({})
-  const [balancesBusy, setBalancesBusy] = React.useState<boolean>(false)
   const [busy, setBusy] = React.useState<string | null>(null)
   const [err, setErr] = React.useState<string | null>(null)
+  const [reloadKey, setReloadKey] = React.useState(0)
+  const [accountBalances, setAccountBalances] = React.useState<Record<string, { amount?: string; currency?: string } | null>>({})
 
-  async function loadAllBalances(links: Link[]) {
-    const accounts = links.flatMap((l) => (l.accounts || []).map((a: string) => ({ accountId: a })))
-    if (!accounts.length) { setAccountBalances({}); return }
-    setBalancesBusy(true)
-    try {
-      const results = await Promise.allSettled(accounts.map(({ accountId }) => fetchWithJson<{ balances?: Balance[] }>(`/gocardless-accounts-balances?account_id=${accountId}`)))
-      const next: Record<string, { amount?: string; currency?: string } | null> = {}
-      results.forEach((r, i) => {
-        let b: { amount?: string; currency?: string } | null = null
-        if (r.status === 'fulfilled') {
-          const list = r.value.balances || []
-          const picked = list.find((x) => x.balanceType === 'interimBooked') || list[0]
-          if (picked?.balanceAmount) b = { amount: picked.balanceAmount.amount, currency: picked.balanceAmount.currency }
-        }
-        next[accounts[i].accountId] = b
-      })
-      setAccountBalances(next)
-    } finally { setBalancesBusy(false) }
+  const loadLinks = () => {
+    setErr(null)
+    setAccountBalances({})
+    setReloadKey((k) => k + 1)
+    refetchLinks()
   }
 
-  async function fetchWithJson<T>(path: string): Promise<T> {
-    const res = await fetch(`${process.env.EXPO_PUBLIC_SUPABASE_URL}/functions/v1${path}`, { cache: 'no-store' })
-    const data = await res.json()
-    if (!res.ok) throw new Error((data as { error?: string })?.error || `HTTP ${res.status}`)
-    return data as T
-  }
+  const accountIds = (links || []).flatMap((l) => (l.accounts || []).map((a: string) => a))
 
   React.useEffect(() => {
-    let cancelled = false
-    ;(async () => {
-      try {
-        const data = await fetchWithJson<Link[]>('/gocardless-links')
-        if (!cancelled) setLinks(data)
-        if (!cancelled) await loadAllBalances(data)
-      } catch (e) {
-        if (!cancelled) setErr(e instanceof Error ? e.message : String(e))
-      }
-    })()
-    return () => { cancelled = true }
-  }, [])
+    if (!linksLoading) {
+      setErr(linksError ? apiErrorMessage(linksError) : null)
+    }
+  }, [linksLoading, linksError])
 
-  async function loadLinks() {
-    setBusy('links'); setErr(null)
-    try {
-      const data = await fetchWithJson<Link[]>('/gocardless-links')
-      setLinks(data)
-      await loadAllBalances(data)
-    } catch (e) { setErr(e instanceof Error ? e.message : String(e)) }
-    finally { setBusy(null) }
-  }
+  React.useEffect(() => {
+    if (links) {
+      setErr(null)
+    }
+  }, [links])
 
-  async function loadAccount(accountId: string) {
-    setSelectedAccount(accountId); setBusy(accountId); setErr(null); setBalances(null); setTxs(null)
-    try {
-      const [b, t] = await Promise.all([
-        fetchWithJson<{ balances?: Balance[] }>(`/gocardless-accounts-balances?account_id=${accountId}`),
-        fetchWithJson<{ transactions?: { booked?: Tx[]; pending?: Tx[] } }>(`/gocardless-accounts-transactions?account_id=${accountId}`),
-      ])
-      setBalances(b); setTxs(t)
-    } catch (e) { setErr(e instanceof Error ? e.message : String(e)) }
-    finally { setBusy(null) }
-  }
-
-  const totalAccounts = links.reduce((n, l) => n + (l.accounts?.length || 0), 0)
-  const booked = txs?.transactions?.booked || []
+  const totalAccounts = accountIds.length
   const entries = Object.entries(accountBalances)
   const totalAmount = entries.reduce((sum, [, b]) => sum + (Number(b?.amount || 0) || 0), 0)
   const totalCurrency = entries.find(([, b]) => b?.currency)?.[1]?.currency || 'EUR'
 
   const byInstitution = entries.reduce<any[]>((acc, [accountId, b]) => {
-    const link = links.find((l) => (l.accounts || []).includes(accountId))
-    if (!link || !b) return acc
+    if (!b) return acc
+    const link = (links || []).find((l) => (l.accounts || []).includes(accountId))
+    if (!link) return acc
     const n = Number(b.amount || 0) || 0
     const cur = b.currency || totalCurrency
     const existing = acc.find((x) => x.institutionId === link.institutionId)
@@ -125,6 +128,12 @@ function HomeScreen() {
     else acc.push({ institutionId: link.institutionId, institutionName: link.institutionName, total: n, currency: cur })
     return acc
   }, [])
+
+  const loadAccountBalances = () => {
+    setBusy('balances')
+    setReloadKey((k) => k + 1)
+    setTimeout(() => setBusy(null), 800)
+  }
 
   return (
     <View style={[styles.container, { paddingTop: 54 }]}>
@@ -136,7 +145,7 @@ function HomeScreen() {
       {err && <Text style={styles.error}>{err}</Text>}
 
       <View style={styles.statsRow}>
-        <Stat label="Collegamenti" value={String(links.length)} />
+        <Stat label="Collegamenti" value={String((links || []).length)} />
         <Stat label="Account" value={String(totalAccounts)} />
         <Stat label="Paese" value="IT" />
       </View>
@@ -146,9 +155,13 @@ function HomeScreen() {
           <Text style={styles.sectionTitle}>Saldo complessivo</Text>
           <View style={styles.totalWrapper}>
             <Text style={styles.totalAmount}>{fmtAmount(totalAmount.toFixed(2), totalCurrency)}</Text>
-            {balancesBusy && <Text style={styles.busy}>Aggiornamento saldi…</Text>}
+            {busy === 'balances' && <Text style={styles.busy}>Aggiornamento saldi…</Text>}
           </View>
+          <TouchableOpacity style={[styles.refreshBtn, busy === 'balances' && styles.refreshBtnBusy]} onPress={loadAccountBalances} disabled={busy === 'balances'}>
+            <Text style={[styles.refreshText, busy === 'balances' && styles.refreshTextBusy]}>Saldi</Text>
+          </TouchableOpacity>
         </View>
+        <AccountBalanceCollector accountIds={accountIds} reloadKey={reloadKey} onChange={setAccountBalances} />
         <FlatList
           data={byInstitution}
           keyExtractor={(item) => item.institutionId}
@@ -177,7 +190,7 @@ function HomeScreen() {
           </TouchableOpacity>
         </View>
         <FlatList
-          data={links}
+          data={links || []}
           keyExtractor={(item) => item.requisitionId}
           showsVerticalScrollIndicator={false}
           contentContainerStyle={styles.linkList}
@@ -195,7 +208,7 @@ function HomeScreen() {
                   <TouchableOpacity
                     key={a}
                     style={[styles.accountBtn, selectedAccount === a && styles.accountBtnActive]}
-                    onPress={() => loadAccount(a)}
+                    onPress={() => setSelectedAccount(a)}
                   >
                     <Text style={[styles.accountText, selectedAccount === a && styles.accountTextActive]}>{busy === a ? '…' : `Account ${a.slice(0, 8)}`}</Text>
                   </TouchableOpacity>
@@ -206,7 +219,7 @@ function HomeScreen() {
             </View>
           )}
         />
-        {!links.length && (
+        {!links?.length && (
           <View style={styles.empty}>
             <Text>Nessun collegamento salvato. Vai su Connetti per iniziare.</Text>
           </View>
@@ -220,47 +233,11 @@ function HomeScreen() {
               <Text style={styles.detailTitle}>Dettaglio account</Text>
               <Text style={styles.detailId}>{selectedAccount}</Text>
             </View>
-            <TouchableOpacity style={styles.detailBtn} onPress={() => loadAccount(selectedAccount)}>
+            <TouchableOpacity style={styles.detailBtn} onPress={() => { setBusy(selectedAccount); setTimeout(() => setBusy(null), 600) }}>
               <Text style={styles.detailBtnText}>Ricarica</Text>
             </TouchableOpacity>
           </View>
-          {busy === selectedAccount && <View style={styles.loader}><ActivityIndicator size="small" color="#22d3ee" /></View>}
-          <View style={styles.detailGrid}>
-            <View style={styles.detailCard}>
-              <Text style={styles.detailSubtitle}>Saldi</Text>
-              <View style={styles.balanceList}>
-                {(balances?.balances || []).map((b, i) => (
-                  <View key={i} style={styles.balanceItem}>
-                    <Text style={styles.balanceType}>{b.balanceType || 'Balance'}</Text>
-                    <Text style={styles.balanceAmount}>{fmtAmount(b.balanceAmount?.amount, b.balanceAmount?.currency)}</Text>
-                  </View>
-                ))}
-                {!balances?.balances?.length && <Text style={styles.noData}>Nessun saldo disponibile.</Text>}
-              </View>
-            </View>
-            <View style={styles.detailCard}>
-              <View style={styles.detailSubtitleRow}>
-                <Text style={styles.detailSubtitle}>Transazioni contabilizzate</Text>
-                <Text style={styles.detailCount}>{booked.length} voci</Text>
-              </View>
-              <View style={styles.txList}>
-                {booked.slice(0, 80).map((t, i) => {
-                  const amt = Number(t.transactionAmount?.amount || 0)
-                  const negative = !Number.isNaN(amt) && amt < 0
-                  return (
-                    <View key={t.transactionId || t.internalTransactionId || i} style={styles.txItem}>
-                      <View style={styles.txBody}>
-                        <Text style={styles.txTitle}>{t.remittanceInformationUnstructured || t.creditorName || t.debtorName || 'Transazione'}</Text>
-                        <Text style={styles.txDate}>{t.bookingDate || t.valueDate || '—'}</Text>
-                      </View>
-                      <Text style={[styles.txAmount, negative ? styles.txNegative : styles.txPositive]}>{fmtAmount(t.transactionAmount?.amount, t.transactionAmount?.currency)}</Text>
-                    </View>
-                  )
-                })}
-                {!booked.length && <Text style={styles.noData}>Nessuna transazione contabilizzata disponibile.</Text>}
-              </View>
-            </View>
-          </View>
+          <AccountDetailScreen accountId={selectedAccount} setErr={setErr} />
         </View>
       )}
 
@@ -269,64 +246,94 @@ function HomeScreen() {
   )
 }
 
+function AccountDetailScreen({ accountId, setErr }: { accountId: string; setErr: (e: string | null) => void }) {
+  const { data: balancesData, isLoading: bLoading, error: bError } = useGetAccountBalancesQuery(accountId, { skip: !accountId })
+  const { data: txsData, isLoading: tLoading, error: tError } = useGetAccountTransactionsQuery(accountId, { skip: !accountId })
+
+  React.useEffect(() => {
+    if (bError || tError) setErr(apiErrorMessage(bError || tError))
+  }, [bError, tError, setErr])
+
+  const isLoading = bLoading || tLoading
+  const balances = balancesData
+  const txs = txsData
+  const booked = txs?.transactions?.booked || []
+
+  if (!accountId) return null
+
+  return (
+    <View style={styles.detailGrid}>
+      <View style={styles.detailCard}>
+        <Text style={styles.detailSubtitle}>Saldi</Text>
+        <View style={styles.balanceList}>
+          {isLoading && <View style={styles.loader}><ActivityIndicator size="small" color="#22d3ee" /></View>}
+          {!isLoading && (balances?.balances || []).map((b, i) => (
+            <View key={i} style={styles.balanceItem}>
+              <Text style={styles.balanceType}>{b.balanceType || 'Balance'}</Text>
+              <Text style={styles.balanceAmount}>{fmtAmount(b.balanceAmount?.amount, b.balanceAmount?.currency)}</Text>
+            </View>
+          ))}
+          {!isLoading && !balances?.balances?.length && <Text style={styles.noData}>Nessun saldo disponibile.</Text>}
+        </View>
+      </View>
+      <View style={styles.detailCard}>
+        <View style={styles.detailSubtitleRow}>
+          <Text style={styles.detailSubtitle}>Transazioni contabilizzate</Text>
+          <Text style={styles.detailCount}>{booked.length} voci</Text>
+        </View>
+        <View style={styles.txList}>
+          {isLoading && <View style={styles.loader}><ActivityIndicator size="small" color="#22d3ee" /></View>}
+          {!isLoading && booked.slice(0, 80).map((t, i) => {
+            const amt = Number(t.transactionAmount?.amount || 0)
+            const negative = !Number.isNaN(amt) && amt < 0
+            return (
+              <View key={t.transactionId || t.internalTransactionId || i} style={styles.txItem}>
+                <View style={styles.txBody}>
+                  <Text style={styles.txTitle}>{t.remittanceInformationUnstructured || t.creditorName || t.debtorName || 'Transazione'}</Text>
+                  <Text style={styles.txDate}>{t.bookingDate || t.valueDate || '—'}</Text>
+                </View>
+                <Text style={[styles.txAmount, negative ? styles.txNegative : styles.txPositive]}>{fmtAmount(t.transactionAmount?.amount, t.transactionAmount?.currency)}</Text>
+              </View>
+            )
+          })}
+          {!isLoading && !booked.length && <Text style={styles.noData}>Nessuna transazione contabilizzata disponibile.</Text>}
+        </View>
+      </View>
+    </View>
+  )
+}
+
 function ConnectScreen() {
   const [country] = React.useState('it')
   const [q, setQ] = React.useState('')
-  const [institutions, setInstitutions] = React.useState<any[]>([])
-  const [links, setLinks] = React.useState<Link[]>([])
+  const { data: institutions, isLoading: instLoading, error: instError } = useGetInstitutionsQuery(country)
+  const { data: links, refetch: refetchLinks } = useGetLinksQuery()
   const [busy, setBusy] = React.useState<string | null>(null)
   const [err, setErr] = React.useState<string | null>(null)
+  const [createRequisition, { isLoading: creating }] = useCreateRequisitionMutation()
 
-  async function fetchWithJson<T>(path: string, init?: RequestInit): Promise<T> {
-    const res = await fetch(`${process.env.EXPO_PUBLIC_SUPABASE_URL}/functions/v1${path}`, { ...init, cache: 'no-store' })
-    const data = await res.json()
-    if (!res.ok) throw new Error((data as { error?: string })?.error || `HTTP ${res.status}`)
-    return data as T
-  }
+  const loadLinks = () => { setErr(null); refetchLinks() }
 
-  React.useEffect(() => {
-    let cancelled = false
-    ;(async () => {
-      try {
-        const data = await fetchWithJson<Link[]>('/gocardless-links')
-        if (!cancelled) setLinks(data)
-      } catch (e) {
-        if (!cancelled) setErr(e instanceof Error ? e.message : String(e))
-      }
-    })()
-    return () => { cancelled = true }
-  }, [])
-
-  async function loadLinks() {
-    setBusy('links'); setErr(null)
-    try { setLinks(await fetchWithJson<Link[]>('/gocardless-links')) }
-    catch (e) { setErr(e instanceof Error ? e.message : String(e)) }
-    finally { setBusy(null) }
-  }
-
-  async function search() {
-    setBusy('search'); setErr(null)
-    try { setInstitutions(await fetchWithJson<any[]>(`/gocardless-institutions?country=${encodeURIComponent(country)}`)) }
-    catch (e) { setErr(e instanceof Error ? e.message : String(e)) }
-    finally { setBusy(null) }
+  const search = () => {
+    setErr(null)
   }
 
   const filtered = React.useMemo(() => {
     const s = q.trim().toLowerCase()
-    const base = s ? institutions.filter((i) => i.name.toLowerCase().includes(s) || (i.bic || '').toLowerCase().includes(s)) : institutions
+    const base = s ? (institutions || []).filter((i) => i.name.toLowerCase().includes(s) || (i.bic || '').toLowerCase().includes(s)) : (institutions || [])
     return base.slice(0, 50)
   }, [institutions, q])
 
-  async function connect(inst: any) {
+  async function connect(inst: Institution) {
     setBusy(inst.id); setErr(null)
     try {
-      const data = await fetchWithJson<{ link: string }>('/gocardless-requisitions', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ institutionId: inst.id, institutionName: inst.name, country }),
-      })
+      const data = await createRequisition({ institutionId: inst.id, institutionName: inst.name, country }).unwrap()
       await Linking.openURL(data.link)
-    } catch (e) { setErr(e instanceof Error ? e.message : String(e)); setBusy(null) }
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(null)
+    }
   }
 
   return (
@@ -337,6 +344,7 @@ function ConnectScreen() {
       </View>
 
       {err && <Text style={styles.error}>{err}</Text>}
+      {instError && <Text style={styles.error}>{instError instanceof Error ? instError.message : String(instError)}</Text>}
 
       <View style={styles.section}>
         <View style={styles.sectionRow}>
@@ -349,7 +357,7 @@ function ConnectScreen() {
           <View style={styles.countrySelect}>
             <Text style={styles.countryLabel}>{country === 'it' ? 'Italia' : country === 'es' ? 'Spagna' : country === 'gb' ? 'Regno Unito' : country === 'de' ? 'Germania' : 'Francia'}</Text>
           </View>
-          <TouchableOpacity style={[styles.searchBtn, busy === 'search' && styles.searchBtnBusy]} onPress={search} disabled={busy === 'search'}>
+          <TouchableOpacity style={[styles.searchBtn, busy === 'search' && styles.searchBtnBusy]} onPress={search} disabled={busy === 'search' || instLoading}>
             <Text style={[styles.searchBtnText, busy === 'search' && styles.searchBtnTextBusy]}>{busy === 'search' ? 'Caricamento…' : 'Carica istituti'}</Text>
           </TouchableOpacity>
         </View>
@@ -367,7 +375,7 @@ function ConnectScreen() {
           showsVerticalScrollIndicator={false}
           contentContainerStyle={styles.instListTab}
           renderItem={({ item }) => (
-            <TouchableOpacity style={styles.instCardTab} onPress={() => connect(item)} disabled={!!busy}>
+            <TouchableOpacity style={styles.instCardTab} onPress={() => connect(item)} disabled={!!busy || instLoading || creating}>
               <View style={styles.instBody}>
                 <View style={styles.instAvatar}>
                   <Text style={styles.instAvatarText}>{item.name.slice(0, 2).toUpperCase()}</Text>
@@ -381,7 +389,7 @@ function ConnectScreen() {
             </TouchableOpacity>
           )}
         />
-        {!filtered.length && (
+        {!filtered.length && !instLoading && (
           <View style={styles.empty}>
             <Text>Carica gli istituti per il paese selezionato, poi filtra per banca.</Text>
           </View>
@@ -390,16 +398,14 @@ function ConnectScreen() {
 
       <View style={styles.section}>
         <View style={styles.sectionRow}>
-          <View>
-            <Text style={styles.sectionTitle}>Collegamenti esistenti</Text>
-            <Text style={styles.sectionSubtitle}>Stato consenso e account disponibili.</Text>
-          </View>
+          <Text style={styles.sectionTitle}>Collegamenti esistenti</Text>
+          <Text style={styles.sectionSubtitle}>Stato consenso e account disponibili.</Text>
           <TouchableOpacity style={[styles.refreshBtn, busy === 'links' && styles.refreshBtnBusy]} onPress={loadLinks} disabled={busy === 'links'}>
             <Text style={[styles.refreshText, busy === 'links' && styles.refreshTextBusy]}>{busy === 'links' ? 'Aggiorno…' : 'Aggiorna'}</Text>
           </TouchableOpacity>
         </View>
         <FlatList
-          data={links}
+          data={links || []}
           keyExtractor={(item) => item.requisitionId}
           showsVerticalScrollIndicator={false}
           contentContainerStyle={styles.linkList}
@@ -424,7 +430,7 @@ function ConnectScreen() {
             </View>
           )}
         />
-        {!links.length && (
+        {!links?.length && (
           <View style={styles.empty}>
             <Text>Nessun collegamento salvato. Connetti una banca per iniziare.</Text>
           </View>
@@ -436,93 +442,10 @@ function ConnectScreen() {
   )
 }
 
-function AccountDetailScreen({ route }: { route: any }) {
-  const { accountId } = route.params
-  const [balances, setBalances] = React.useState<{ balances?: Balance[] } | null>(null)
-  const [txs, setTxs] = React.useState<{ transactions?: { booked?: Tx[]; pending?: Tx[] } } | null>(null)
-  const [busy, setBusy] = React.useState<boolean>(false)
-
-  async function fetchWithJson<T>(path: string): Promise<T> {
-    const res = await fetch(`${process.env.EXPO_PUBLIC_SUPABASE_URL}/functions/v1${path}`, { cache: 'no-store' })
-    const data = await res.json()
-    if (!res.ok) throw new Error((data as { error?: string })?.error || `HTTP ${res.status}`)
-    return data as T
-  }
-
-  React.useEffect(() => {
-    let cancelled = false
-    ;(async () => {
-      setBusy(true)
-      try {
-        const [b, t] = await Promise.all([
-          fetchWithJson<{ balances?: Balance[] }>(`/gocardless-accounts-balances?account_id=${accountId}`),
-          fetchWithJson<{ transactions?: { booked?: Tx[]; pending?: Tx[] } }>(`/gocardless-accounts-transactions?account_id=${accountId}`),
-        ])
-        if (!cancelled) { setBalances(b); setTxs(t) }
-      } catch (e) { console.error(e) }
-      finally { if (!cancelled) setBusy(false) }
-    })()
-    return () => { cancelled = true }
-  }, [accountId])
-
-  const booked = txs?.transactions?.booked || []
-
-  return (
-    <View style={[styles.container, { paddingTop: 54 }]}>
-      <View style={styles.header}>
-        <Text style={styles.title}>Dettaglio account</Text>
-        <Text style={styles.subtitle}>{accountId}</Text>
-      </View>
-
-      {busy && <View style={styles.loader}><ActivityIndicator size="small" color="#22d3ee" /></View>}
-
-      <View style={styles.detailGrid}>
-        <View style={styles.detailCard}>
-          <Text style={styles.detailSubtitle}>Saldi</Text>
-          <View style={styles.balanceList}>
-            {(balances?.balances || []).map((b, i) => (
-              <View key={i} style={styles.balanceItem}>
-                <Text style={styles.balanceType}>{b.balanceType || 'Balance'}</Text>
-                <Text style={styles.balanceAmount}>{fmtAmount(b.balanceAmount?.amount, b.balanceAmount?.currency)}</Text>
-              </View>
-            ))}
-            {!balances?.balances?.length && <Text style={styles.noData}>Nessun saldo disponibile.</Text>}
-          </View>
-        </View>
-        <View style={styles.detailCard}>
-          <View style={styles.detailSubtitleRow}>
-            <Text style={styles.detailSubtitle}>Transazioni contabilizzate</Text>
-            <Text style={styles.detailCount}>{booked.length} voci</Text>
-          </View>
-          <View style={styles.txList}>
-            {booked.slice(0, 80).map((t, i) => {
-              const amt = Number(t.transactionAmount?.amount || 0)
-              const negative = !Number.isNaN(amt) && amt < 0
-              return (
-                <View key={t.transactionId || t.internalTransactionId || i} style={styles.txItem}>
-                  <View style={styles.txBody}>
-                    <Text style={styles.txTitle}>{t.remittanceInformationUnstructured || t.creditorName || t.debtorName || 'Transazione'}</Text>
-                    <Text style={styles.txDate}>{t.bookingDate || t.valueDate || '—'}</Text>
-                  </View>
-                  <Text style={[styles.txAmount, negative ? styles.txNegative : styles.txPositive]}>{fmtAmount(t.transactionAmount?.amount, t.transactionAmount?.currency)}</Text>
-                </View>
-              )
-            })}
-            {!booked.length && <Text style={styles.noData}>Nessuna transazione contabilizzata disponibile.</Text>}
-          </View>
-        </View>
-      </View>
-
-      <StatusBar barStyle="light-content" />
-    </View>
-  )
-}
-
 function HomeTab() {
   return (
     <Stack.Navigator screenOptions={{ headerShown: false }}>
       <Stack.Screen name="Home" component={HomeScreen} />
-      <Stack.Screen name="AccountDetail" component={AccountDetailScreen} />
     </Stack.Navigator>
   )
 }
@@ -537,18 +460,20 @@ function ConnectTab() {
 
 export default function App() {
   return (
-    <NavigationContainer>
-      <Tab.Navigator
-        screenOptions={{
-          tabBarActiveTintColor: '#22d3ee',
-          tabBarInactiveTintColor: '#94a3b8',
-          tabBarStyle: { backgroundColor: 'rgba(15,23,42,0.95)', borderTopWidth: 1, borderTopColor: 'rgba(255,255,255,0.08)', paddingTop: 6 },
-        }}
-      >
-        <Tab.Screen name="Home" component={HomeTab} options={{ title: 'Home' }} />
-        <Tab.Screen name="Connect" component={ConnectTab} options={{ title: 'Connetti' }} />
-      </Tab.Navigator>
-    </NavigationContainer>
+    <Provider store={store}>
+      <NavigationContainer>
+        <Tab.Navigator
+          screenOptions={{
+            tabBarActiveTintColor: '#22d3ee',
+            tabBarInactiveTintColor: '#94a3b8',
+            tabBarStyle: { backgroundColor: 'rgba(15,23,42,0.95)', borderTopWidth: 1, borderTopColor: 'rgba(255,255,255,0.08)', paddingTop: 6 },
+          }}
+        >
+          <Tab.Screen name="Home" component={HomeTab} options={{ title: 'Home' }} />
+          <Tab.Screen name="Connect" component={ConnectTab} options={{ title: 'Connetti' }} />
+        </Tab.Navigator>
+      </NavigationContainer>
+    </Provider>
   )
 }
 
